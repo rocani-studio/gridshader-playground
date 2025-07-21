@@ -14,6 +14,7 @@ import gridFragment from "./shaders/grid/fragment.glsl";
  */
 // Debug
 const gui = new GUI({ width: 325 });
+// gui.hide();
 const debugObject = {};
 
 // Canvas
@@ -89,6 +90,19 @@ const sizes = {
 
 // ─── SHADER PLANE SETUP ─────────────────────────────────────────────────────────
 
+/**
+ * Camera
+ */
+// Base camera
+const camera = new THREE.PerspectiveCamera(
+  75,
+  sizes.width / sizes.height,
+  0.1,
+  100
+);
+camera.position.set(0, 0, 10);
+scene.add(camera);
+
 // 1) create a fullscreen orthographic camera
 const orthoCam = new THREE.OrthographicCamera(
   -sizes.width / 2,
@@ -108,15 +122,18 @@ const shaderMat = new THREE.ShaderMaterial({
     uTexture: { value: null },
     uColor1: { value: new THREE.Color(0xffffff) },
     uColor2: { value: new THREE.Color(0xffeeee) },
-    uGridSize: { value: 50 },
-    uRefractionStrength: { value: 0.9 },
+    uGridSize: { value: 68 },
+    uRefractionStrength: { value: 0.2 },
     uHexagon: { value: false },
+    uBlurRadius: { value: 1.0 },
+    uDisplace: { value: false },
   },
   vertexShader: gridVertex,
   fragmentShader: gridFragment,
   depthWrite: false,
   side: THREE.DoubleSide,
   transparent: true,
+  // wireframe: true,
 });
 
 // Tweaks
@@ -128,25 +145,77 @@ if (gui) {
     .add(shaderMat.uniforms.uRefractionStrength, "value", 0, 2.2, 0.001)
     .name("Refraction Strength");
   gui.add(shaderMat.uniforms.uHexagon, "value").name("Hexagons");
+  gui
+    .add(shaderMat.uniforms.uDisplace, "value")
+    .name("Displace Geometry")
+    .onChange((enabled) => {
+      // `enabled` is true/false
+      if (enabled) {
+        // e.g. re-compute any buffers or flags you need
+        controls.enabled = true;
+        // maybe rebuild your quad’s geometry normals, or reset a timer:
+        // rebuildDisplacement();
+      } else {
+        controls.enabled = false;
+      }
+    });
 }
 
+const z = 10;
+
+// 2) compute the frustum size at z
+const fovInRad = THREE.MathUtils.degToRad(camera.fov);
+const heightAtZ = 2 * z * Math.tan(fovInRad / 2);
+const widthAtZ = heightAtZ * camera.aspect;
+
 // 3) fullscreen quad
-const quadGeo = new THREE.PlaneGeometry(sizes.width, sizes.height);
+const quadGeo = new THREE.PlaneGeometry(1, 1, 90, 90);
 const testMat = new THREE.MeshBasicMaterial();
 const quadMesh = new THREE.Mesh(quadGeo, shaderMat);
-scene.add(quadMesh);
+quadMesh.scale.set(widthAtZ, heightAtZ, 1);
 
-const tex = loader.load("/img/t.jpg", () => {
+// scene.add(quadMesh);
+scene.add(quadMesh);
+quadMesh.position.set(0, 0, -z + 10);
+
+const tex = loader.load("/img/blommor5.png", () => {
   // optional: once loaded, you can set any wrap/filter modes:
   //   tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
   tex.minFilter = THREE.NearestFilter;
 
   console.log(tex.image);
 });
-testMat.map = tex;
-testMat.needsUpdate = true;
+// testMat.map = tex;
+// testMat.needsUpdate = true;
 shaderMat.uniforms.uTexture.value = tex;
 shaderMat.needsUpdate = true;
+
+const video = document.getElementById("video");
+
+// 2. (Optional, but highly recommended) make it muted so browsers will autoplay it
+//    — without a user gesture most browsers block un-muted video.play()
+video.muted = true;
+video.loop = true; // loop if you like
+video.playsInline = true; // for mobile Safari
+
+// 3. Tell the browser to play it
+video
+  .play()
+  .then(() => {
+    // video.pause();
+    // once it’s playing, hook it into your Three.js texture
+    const vidTex = new THREE.VideoTexture(video);
+    shaderMat.uniforms.uTexture.value = vidTex;
+    shaderMat.needsUpdate = true;
+  })
+  .catch((err) => {
+    console.error("Video playback failed:", err);
+    // you may need to wait for a user gesture (e.g. button click) to start playback
+  });
+
+// const vidTex = new THREE.VideoTexture(video);
+// shaderMat.uniforms.uTexture.value = vidTex;
+// shaderMat.needsUpdate = true;
 
 window.addEventListener("resize", () => {
   // Update sizes
@@ -183,18 +252,47 @@ window.addEventListener("pointermove", (event) => {
   shaderMat.uniforms.uMouse.value.set(x, y);
 });
 
-/**
- * Camera
- */
-// Base camera
-const camera = new THREE.PerspectiveCamera(
-  35,
-  sizes.width / sizes.height,
-  0.1,
-  100
-);
-camera.position.set(13, -3, -5);
-scene.add(camera);
+// ─── INSTANCED GRID OF SPHERES ──────────────────────────────────────────────
+
+// Parameters
+const sphereRadius = 0.05; // adjust to taste
+const diameter = sphereRadius * 2;
+const sphereGeo = new THREE.SphereGeometry(sphereRadius, 16, 16);
+const sphereMat = new THREE.MeshStandardMaterial({ color: 0xddddff });
+
+// Helper: build grid once (and on resize)
+let sphereMesh;
+function buildSphereGrid() {
+  // remove old
+  if (sphereMesh) scene.remove(sphereMesh);
+
+  // compute how many cols/rows fit in view
+  const viewWidth = orthoCam.right - orthoCam.left;
+  const viewHeight = orthoCam.top - orthoCam.bottom;
+  const cols = Math.ceil(viewWidth / diameter);
+  const rows = Math.ceil(viewHeight / diameter);
+  const count = cols * rows;
+
+  // create instanced mesh
+  sphereMesh = new THREE.InstancedMesh(sphereGeo, sphereMat, count);
+  let idx = 0;
+  const tmpMat = new THREE.Matrix4();
+
+  for (let i = 0; i < cols; i++) {
+    for (let j = 0; j < rows; j++) {
+      const x = orthoCam.left + diameter * (i + 0.5);
+      const y = orthoCam.bottom + diameter * (j + 0.5);
+      tmpMat.makeTranslation(x, y, 0);
+      sphereMesh.setMatrixAt(idx++, tmpMat);
+    }
+  }
+
+  sphereMesh.instanceMatrix.needsUpdate = true;
+  scene.add(sphereMesh);
+}
+
+// initial build
+// buildSphereGrid();
 
 // Controls
 const controls = new OrbitControls(camera, canvas);
@@ -225,10 +323,12 @@ const tick = () => {
   const elapsedTime = clock.getElapsedTime();
 
   // Update controls
-  //   controls.update();
+  if (shaderMat.uniforms.uDisplace.value) {
+    controls.update();
+  }
 
   // Render
-  renderer.render(scene, orthoCam);
+  renderer.render(scene, camera);
 
   shaderMat.uniforms.uTime.value = clock.getElapsedTime();
 
